@@ -1,4 +1,4 @@
-# # DataProfiler — Industry-Grade EDA Tool
+#  DataProfiler — Industry-Grade EDA Tool
 
 Upload any CSV or Excel file and get a full exploratory data analysis report instantly — with data quality scoring, outlier detection, bivariate analysis, AI-powered summary, and a downloadable PDF report. Built with Python and Streamlit, runs completely free on Google Colab.
 
