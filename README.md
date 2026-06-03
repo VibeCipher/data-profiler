@@ -1,4 +1,6 @@
-#  DataProfiler — Industry-Grade EDA Tool
+# DataProfiler — Industry-Grade EDA Tool
+
+🔗 **Live Demo: [soham-dataprofiler.streamlit.app](https://cipher-dataprofiler.streamlit.app)**
 
 Upload any CSV or Excel file and get a full exploratory data analysis report instantly — with data quality scoring, outlier detection, bivariate analysis, AI-powered summary, and a downloadable PDF report. Built with Python and Streamlit, runs completely free on Google Colab.
 
@@ -36,7 +38,12 @@ AI Summary: Dataset covers Titanic passenger survival...
 
 ## Quickstart
 
-### Step 1 — Get a free Groq API key
+### Try it instantly
+Visit **[soham-dataprofiler.streamlit.app](https://cipher-dataprofiler.streamlit.app)** — no setup, no install, just upload your CSV or Excel and explore.
+
+---
+
+### Step 1 — Get a free Groq API key (for local/Colab use)
 1. Go to [console.groq.com](https://console.groq.com)
 2. Sign up → API Keys → Create API Key
 3. Copy the key
