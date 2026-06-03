@@ -1,6 +1,6 @@
 # DataProfiler — Industry-Grade EDA Tool
 
-🔗 **Live Demo: [soham-dataprofiler.streamlit.app](https://cipher-dataprofiler.streamlit.app)**
+🔗 **Live Demo: [cipher-dataprofiler.streamlit.app](https://cipher-dataprofiler.streamlit.app)**
 
 Upload any CSV or Excel file and get a full exploratory data analysis report instantly — with data quality scoring, outlier detection, bivariate analysis, AI-powered summary, and a downloadable PDF report. Built with Python and Streamlit, runs completely free on Google Colab.
 
@@ -39,7 +39,7 @@ AI Summary: Dataset covers Titanic passenger survival...
 ## Quickstart
 
 ### Try it instantly
-Visit **[soham-dataprofiler.streamlit.app](https://cipher-dataprofiler.streamlit.app)** — no setup, no install, just upload your CSV or Excel and explore.
+Visit **[cipher-dataprofiler.streamlit.app](https://cipher-dataprofiler.streamlit.app)** — no setup, no install, just upload your CSV or Excel and explore.
 
 ---
 
