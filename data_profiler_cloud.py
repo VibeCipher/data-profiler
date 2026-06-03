@@ -1,0 +1,954 @@
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from groq import Groq
+import os
+from fpdf import FPDF
+
+st.set_page_config(page_title="DataProfiler", page_icon="📊", layout="wide")
+
+st.markdown("""
+<style>
+.stApp { background-color: #0D0D0D; color: #F0F0F0; }
+section[data-testid="stSidebar"] { background: #111111; border-right: 1px solid #1F1F1F; }
+.neon-title { font-size: 2rem; font-weight: 700; background: linear-gradient(90deg, #00F5A0, #00D9F5); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.subtitle { color: #888; font-size: 0.9rem; margin-bottom: 20px; }
+.section-label { color: #00F5A0; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 6px; }
+.stButton > button { background: linear-gradient(135deg, #00F5A0, #00D9F5) !important; color: #0D0D0D !important; border: none !important; border-radius: 8px !important; font-weight: 700 !important; width: 100% !important; padding: 10px !important; }
+[data-testid="stMetricValue"] { color: #00F5A0 !important; font-weight: 700 !important; }
+[data-testid="stMetricLabel"] { color: #888 !important; }
+.stTabs [data-baseweb="tab-list"] { background: #141414; border-radius: 10px; padding: 4px; gap: 4px; }
+.stTabs [data-baseweb="tab"] { background: transparent !important; color: #888 !important; border-radius: 8px !important; padding: 8px 16px !important; }
+.stTabs [aria-selected="true"] { background: linear-gradient(135deg, #00F5A0, #00D9F5) !important; color: #0D0D0D !important; font-weight: 700 !important; }
+.stDataFrame { border: 1px solid #2A2A2A !important; border-radius: 10px !important; }
+[data-testid="stFileUploader"] { background: #141414 !important; border: 1px dashed #2A2A2A !important; border-radius: 10px !important; }
+.stDownloadButton > button { background: linear-gradient(135deg, #00F5A0, #00D9F5) !important; color: #0D0D0D !important; border: none !important; border-radius: 8px !important; font-weight: 700 !important; width: 100% !important; }
+hr { border-color: #1F1F1F !important; }
+label { color: #AAAAAA !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Helpers ───────────────────────────────────────────────────
+def dark_fig(w=10, h=4):
+    fig, ax = plt.subplots(figsize=(w, h))
+    fig.patch.set_facecolor("#141414")
+    ax.set_facecolor("#141414")
+    ax.tick_params(colors="#AAAAAA", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#2A2A2A")
+    return fig, ax
+
+def detect_outliers(series):
+    Q1, Q3 = series.quantile(0.25), series.quantile(0.75)
+    IQR    = Q3 - Q1
+    lower, upper = Q1 - 1.5*IQR, Q3 + 1.5*IQR
+    return len(series[(series < lower) | (series > upper)]), round(lower,2), round(upper,2)
+
+def get_skew_label(s):
+    if s > 1:     return "Highly right-skewed — consider log transform"
+    elif s > 0.5: return "Moderately right-skewed"
+    elif s < -1:  return "Highly left-skewed — consider square transform"
+    elif s < -0.5: return "Moderately left-skewed"
+    return "Approximately normal"
+
+def get_groq_key():
+    try:    return st.secrets["GROQ_API_KEY"]
+    except: return os.environ.get("GROQ_API_KEY", "")
+
+def load_data(f):
+    name = f.name.lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(f)
+    elif name.endswith(".csv"):
+        return pd.read_csv(f)
+    else:
+        return pd.read_csv(f)
+
+def safe(val):
+    return str(val).encode("ascii", "replace").decode("ascii")
+
+def data_quality_score(df):
+    scores = {}
+    total  = df.shape[0] * df.shape[1]
+
+    # Missing score (0-30)
+    miss_pct = df.isnull().sum().sum() / total * 100
+    scores["Missing Values"] = max(0, 30 - int(miss_pct * 2))
+
+    # Duplicate score (0-20)
+    dup_pct = df.duplicated().sum() / len(df) * 100
+    scores["Duplicates"] = max(0, 20 - int(dup_pct * 4))
+
+    # Constant columns (0-20)
+    const_cols = [c for c in df.columns if df[c].nunique() <= 1]
+    scores["Constant Columns"] = max(0, 20 - len(const_cols) * 5)
+
+    # High cardinality (0-15)
+    obj_cols = df.select_dtypes(include="object").columns
+    high_card = [c for c in obj_cols if df[c].nunique() / len(df) > 0.8]
+    scores["High Cardinality"] = max(0, 15 - len(high_card) * 5)
+
+    # Skewness (0-15) — skip binary columns
+    num_cols = df.select_dtypes(include=np.number).columns
+    highly_skewed = [c for c in num_cols
+                     if df[c].nunique() > 2 and abs(df[c].skew()) > 2]
+    scores["Skewness"] = max(0, 15 - len(highly_skewed) * 3)
+
+    total_score = sum(scores.values())
+    return total_score, scores
+
+def get_feature_recommendations(df, target_col=None):
+    recs = []
+    num_cols = df.select_dtypes(include=np.number).columns.tolist()
+    obj_cols = df.select_dtypes(include="object").columns.tolist()
+
+    for col in df.columns:
+        # Constant columns
+        if df[col].nunique() <= 1:
+            recs.append({"Column": col, "Issue": "Constant/Zero variance",
+                         "Recommendation": "DROP — adds no information to any model"})
+            continue
+
+        # High cardinality
+        if col in obj_cols:
+            ratio = df[col].nunique() / len(df)
+            if ratio > 0.8:
+                recs.append({"Column": col, "Issue": "High cardinality (" + str(df[col].nunique()) + " unique)",
+                             "Recommendation": "DROP or use target encoding — one-hot will explode dimensionality"})
+            elif df[col].nunique() <= 10:
+                recs.append({"Column": col, "Issue": "Low cardinality (" + str(df[col].nunique()) + " unique)",
+                             "Recommendation": "One-hot encode or label encode before modelling"})
+
+        # High missing
+        miss_pct = df[col].isnull().sum() / len(df) * 100
+        if miss_pct > 50:
+            recs.append({"Column": col, "Issue": str(round(miss_pct,1)) + "% missing",
+                         "Recommendation": "DROP — too much data missing to impute reliably"})
+        elif miss_pct > 20:
+            recs.append({"Column": col, "Issue": str(round(miss_pct,1)) + "% missing",
+                         "Recommendation": "Impute with median/mode or use model-based imputation"})
+        elif miss_pct > 0:
+            recs.append({"Column": col, "Issue": str(round(miss_pct,1)) + "% missing",
+                         "Recommendation": "Simple imputation — median for numeric, mode for categorical"})
+
+        # Skewness and outliers — skip binary columns
+        if col in num_cols:
+            s = df[col].dropna()
+            if len(s) > 0 and s.nunique() > 2:
+                skew = abs(float(s.skew()))
+                if skew > 2:
+                    recs.append({"Column": col, "Issue": "High skewness (" + str(round(skew,2)) + ")",
+                                 "Recommendation": "Apply log1p or Box-Cox transform before modelling"})
+                n_out, _, _ = detect_outliers(s)
+                out_pct = round(n_out / len(s) * 100, 1)
+                if out_pct > 5:
+                    recs.append({"Column": col, "Issue": str(out_pct) + "% outliers",
+                                 "Recommendation": "Cap at IQR bounds (Winsorization) or investigate individually"})
+
+    # Negative value detection
+    for col in num_cols:
+        if col in df.columns:
+            neg_count = int((df[col] < 0).sum())
+            if neg_count > 0:
+                recs.append({"Column": col,
+                             "Issue": str(neg_count) + " negative values",
+                             "Recommendation": "Investigate — negative values may be data entry errors"})
+
+    # Almost constant detection
+    for col in df.columns:
+        if df[col].nunique() == 2:
+            top_pct = df[col].value_counts(normalize=True).max()
+            if top_pct > 0.99:
+                recs.append({"Column": col,
+                             "Issue": "Almost constant (" + str(round(top_pct*100,1)) + "% same value)",
+                             "Recommendation": "DROP — near-zero variance adds no predictive power"})
+
+    if not recs:
+        recs.append({"Column": "All columns", "Issue": "None detected",
+                     "Recommendation": "Dataset looks clean — proceed with modelling"})
+    # Deduplicate — keep all rows but sort by column
+    recs_df = pd.DataFrame(recs)
+    recs_df = recs_df.sort_values("Column").reset_index(drop=True)
+    return recs_df
+
+
+# ── Header ────────────────────────────────────────────────────
+st.markdown("<div class='neon-title'>DataProfiler</div>", unsafe_allow_html=True)
+st.markdown("<div class='subtitle'>Industry-grade EDA — upload any CSV or Excel</div>", unsafe_allow_html=True)
+st.divider()
+
+uploaded = st.file_uploader("Upload dataset (CSV or Excel)", type=["csv","xlsx","xls"],
+                             accept_multiple_files=False,
+                             label_visibility="collapsed")
+
+if uploaded is not None:
+    if "ai_summary" not in st.session_state:
+        st.session_state["ai_summary"] = ""
+    if "pdf_bytes" not in st.session_state:
+        st.session_state["pdf_bytes"] = None
+    if "pdf_filename" not in st.session_state:
+        st.session_state["pdf_filename"] = ""
+
+    df_raw = load_data(uploaded)
+    df     = df_raw.copy()
+
+    numeric_cols     = df.select_dtypes(include=np.number).columns.tolist()
+    categorical_cols = df.select_dtypes(include="object").columns.tolist()
+    total_cells      = df.shape[0] * df.shape[1]
+    total_missing    = int(df.isnull().sum().sum())
+    missing_pct      = round(total_missing / total_cells * 100, 1)
+    duplicates       = int(df.duplicated().sum())
+    memory_mb        = round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2)
+    df_clean         = df.dropna()
+    quality_score, quality_breakdown = data_quality_score(df)
+
+    # ── Sidebar ───────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("<div class='neon-title' style='font-size:1.2rem'>DataProfiler</div>",
+                    unsafe_allow_html=True)
+        st.divider()
+
+        # Data quality score
+        st.markdown("<div class='section-label'>Data Quality Score</div>",
+                    unsafe_allow_html=True)
+        color = "#00F5A0" if quality_score >= 70 else "#EF9F27" if quality_score >= 50 else "#FF416C"
+        label = "Good" if quality_score >= 70 else "Needs Work" if quality_score >= 50 else "Poor"
+        st.markdown(
+            "<div style='background:#141414;border:1px solid " + color + ";"
+            "border-radius:10px;padding:12px 16px;text-align:center;'>"
+            "<div style='font-size:2rem;font-weight:700;color:" + color + ";'>" +
+            str(quality_score) + "/100</div>"
+            "<div style='color:" + color + ";font-size:0.85rem;'>" + label + "</div>"
+            "</div>",
+            unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        for k, v in quality_breakdown.items():
+            max_v = {"Missing Values":30,"Duplicates":20,"Constant Columns":20,
+                     "High Cardinality":15,"Skewness":15}[k]
+            st.caption("Score - " + k + ": " + str(v) + "/" + str(max_v))
+        st.markdown(
+            "<div style='color:#888;font-size:11px;margin-top:4px;'>"
+            "Actual duplicates: <b style='color:#00F5A0'>" + str(duplicates) + "</b>"
+            "  |  Rows with nulls: <b style='color:#EF9F27'>" + str(len(df) - len(df_clean)) + "</b>"
+            "</div>",
+            unsafe_allow_html=True)
+        st.divider()
+
+        # Target column selector
+        st.markdown("<div class='section-label'>Target Column</div>",
+                    unsafe_allow_html=True)
+        target_col = st.selectbox(
+            "Select target for bivariate analysis",
+            ["None"] + df.columns.tolist(),
+            label_visibility="collapsed"
+        )
+        if target_col == "None":
+            target_col = None
+        st.divider()
+
+        # Quick stats
+        st.markdown("<div class='section-label'>Quick Stats</div>",
+                    unsafe_allow_html=True)
+        st.metric("Rows", f"{df.shape[0]:,}")
+        st.metric("Columns", str(df.shape[1]))
+        st.metric("Missing", str(missing_pct) + "%")
+        st.metric("Memory", str(memory_mb) + " MB")
+
+    # ── Overview ──────────────────────────────────────────────
+    st.markdown("<div class='section-label'>Dataset Overview</div>", unsafe_allow_html=True)
+    m1,m2,m3,m4,m5,m6,m7 = st.columns(7)
+    m1.metric("Rows",          f"{df.shape[0]:,}")
+    m2.metric("Columns",       str(df.shape[1]))
+    m3.metric("Numeric",       str(len(numeric_cols)))
+    m4.metric("Categorical",   str(len(categorical_cols)))
+    m5.metric("Missing %",     str(missing_pct))
+    m5.caption(str(total_missing) + " cells")
+    m6.metric("Duplicates",    str(duplicates))
+    m7.metric("Quality",       str(quality_score) + "/100")
+
+    # Column info table
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("<div class='section-label'>Column Info</div>", unsafe_allow_html=True)
+    col_info = pd.DataFrame({
+        "Column":    df.columns,
+        "Type":      df.dtypes.astype(str).values,
+        "Non-Null":  df.notnull().sum().values,
+        "Null":      df.isnull().sum().values,
+        "Null %":    (df.isnull().sum() / len(df) * 100).round(1).astype(str) + "%",
+        "Unique":    df.nunique().values,
+        "Unique %":  (df.nunique() / len(df) * 100).round(1).astype(str) + "%",
+    })
+    st.dataframe(col_info, use_container_width=True, hide_index=True)
+
+    # Missing value chart
+    if total_missing > 0:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("<div class='section-label'>Missing Values per Column</div>",
+                    unsafe_allow_html=True)
+        miss = df.isnull().sum()
+        miss = miss[miss > 0].sort_values(ascending=False)
+        fig, ax = dark_fig(10, 3)
+        colors = ["#FF416C" if v/len(df) > 0.3 else "#EF9F27" if v/len(df) > 0.1 else "#00D9F5"
+                  for v in miss.values]
+        ax.bar(miss.index, miss.values / len(df) * 100, color=colors, width=0.6)
+        ax.set_title("Missing Value % per Column", color="#F0F0F0", fontsize=11, pad=8)
+        ax.set_ylabel("Missing %", color="#AAAAAA", fontsize=9)
+        ax.tick_params(axis="x", rotation=45, labelsize=8)
+        ax.spines[["top","right"]].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+        st.caption("Red = >30% | Orange = >10% | Blue = <10%")
+
+    # Before/after null removal
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("<div class='section-label'>First 5 rows (raw)</div>", unsafe_allow_html=True)
+        st.dataframe(df_raw.head(), use_container_width=True)
+    with col_b:
+        rows_removed = len(df) - len(df_clean)
+        st.markdown("<div class='section-label'>After dropna (" + str(rows_removed) +
+                    " rows removed, " + str(round(rows_removed/len(df)*100,1)) + "%)</div>",
+                    unsafe_allow_html=True)
+        st.dataframe(df_clean.head(), use_container_width=True)
+
+    # ── Tabs ──────────────────────────────────────────────────
+    tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs([
+        " Numeric ",
+        " Categorical ",
+        " Correlation ",
+        " Bivariate ",
+        " Recommendations ",
+        " AI Summary ",
+        " Download PDF "
+    ])
+
+    # ── TAB 1: Numeric ────────────────────────────────────────
+    with tab1:
+        if not numeric_cols:
+            st.info("No numeric columns found.")
+        else:
+            for col in numeric_cols:
+                s_raw   = df[col]
+                s       = s_raw.dropna()
+                null_ct = int(s_raw.isnull().sum())
+                null_p  = round(null_ct / len(s_raw) * 100, 1)
+                if len(s) == 0:
+                    st.caption(col + ": all null, skipping.")
+                    continue
+
+                is_binary = s.nunique() <= 2
+                n_out, lower, upper = (0, 0, 0) if is_binary else detect_outliers(s)
+                skewness = round(float(s.skew()), 3)
+                kurtosis = round(float(s.kurt()), 3)
+
+                st.markdown("<div class='section-label'>" + col + "</div>",
+                            unsafe_allow_html=True)
+                binary_note = "  |  Binary column — outlier detection skipped" if is_binary else ""
+                st.caption(
+                    "Non-null: " + str(len(s)) +
+                    "  |  Null: " + str(null_ct) + " (" + str(null_p) + "%)" +
+                    "  |  " + get_skew_label(skewness) + binary_note
+                )
+
+                c1,c2,c3,c4,c5,c6,c7,c8 = st.columns(8)
+                c1.metric("Mean",     str(round(float(s.mean()),2)))
+                c2.metric("Median",   str(round(float(s.median()),2)))
+                c3.metric("Mode",     str(round(float(s.mode()[0]),2)))
+                c4.metric("Std Dev",  str(round(float(s.std()),2)))
+                c5.metric("Min",      str(round(float(s.min()),2)))
+                c6.metric("Max",      str(round(float(s.max()),2)))
+                c7.metric("Outliers", str(n_out) + " (" + str(round(n_out/len(s)*100,1)) + "%)")
+                c8.metric("Kurtosis", str(kurtosis))
+
+                st.caption(
+                    "Q1: " + str(round(float(s.quantile(0.25)),2)) +
+                    "  Q2: " + str(round(float(s.quantile(0.5)),2)) +
+                    "  Q3: " + str(round(float(s.quantile(0.75)),2)) +
+                    "  IQR: " + str(round(float(s.quantile(0.75)-s.quantile(0.25)),2)) +
+                    "  P5: " + str(round(float(s.quantile(0.05)),2)) +
+                    "  P95: " + str(round(float(s.quantile(0.95)),2)) +
+                    ("  Outlier bounds: [" + str(lower) + ", " + str(upper) + "]" if not is_binary else "  Outlier bounds: N/A (binary column)")
+                )
+
+                ch1, ch2, ch3 = st.columns(3)
+                with ch1:
+                    fig, ax = dark_fig(5, 3)
+                    ax.hist(s, bins=30, color="#00D9F5", edgecolor="#0D0D0D",
+                            alpha=0.7, density=True, label="Histogram")
+                    try:
+                        if s.nunique() > 2 and s.std() > 0:
+                            s.plot.kde(ax=ax, color="#00F5A0", linewidth=2, label="KDE")
+                    except Exception:
+                        pass
+                    ax.set_title("Distribution + KDE", color="#F0F0F0", fontsize=10, pad=8)
+                    ax.set_xlabel(col, color="#AAAAAA", fontsize=8)
+                    ax.legend(facecolor="#141414", edgecolor="#2A2A2A",
+                              labelcolor="#F0F0F0", fontsize=7)
+                    ax.spines[["top","right"]].set_visible(False)
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close()
+
+                with ch2:
+                    fig2, ax2 = dark_fig(5, 3)
+                    ax2.boxplot(s, vert=False, patch_artist=True,
+                                boxprops=dict(facecolor="#00D9F5", alpha=0.6),
+                                medianprops=dict(color="#00F5A0", linewidth=2),
+                                whiskerprops=dict(color="#AAAAAA"),
+                                capprops=dict(color="#AAAAAA"),
+                                flierprops=dict(marker="o", color="#FF416C",
+                                               alpha=0.5, markersize=4))
+                    ax2.set_title("Box Plot + Outliers", color="#F0F0F0", fontsize=10, pad=8)
+                    ax2.set_xlabel(col, color="#AAAAAA", fontsize=8)
+                    ax2.spines[["top","right"]].set_visible(False)
+                    plt.tight_layout()
+                    st.pyplot(fig2)
+                    plt.close()
+
+                with ch3:
+                    fig3, ax3 = dark_fig(5, 3)
+                    if null_ct > 0:
+                        ax3.pie([len(s), null_ct],
+                                labels=["Non-null","Null"],
+                                colors=["#00F5A0","#FF416C"],
+                                autopct="%1.1f%%",
+                                textprops={"color":"#F0F0F0","fontsize":9},
+                                wedgeprops={"linewidth":0.5,"edgecolor":"#0D0D0D"})
+                        ax3.set_title("Null Check", color="#F0F0F0", fontsize=10, pad=8)
+                    else:
+                        ax3.text(0.5, 0.5, "No nulls", ha="center", va="center",
+                                 color="#00F5A0", fontsize=14, transform=ax3.transAxes)
+                        ax3.set_title("Null Check", color="#F0F0F0", fontsize=10, pad=8)
+                        ax3.axis("off")
+                    plt.tight_layout()
+                    st.pyplot(fig3)
+                    plt.close()
+
+                st.divider()
+
+    # ── TAB 2: Categorical ────────────────────────────────────
+    with tab2:
+        if not categorical_cols:
+            st.info("No categorical columns found.")
+        else:
+            for col in categorical_cols:
+                s_raw   = df[col]
+                s       = s_raw.dropna()
+                null_ct = int(s_raw.isnull().sum())
+                null_p  = round(null_ct / len(s_raw) * 100, 1)
+                if len(s) == 0:
+                    st.caption(col + ": all null, skipping.")
+                    continue
+
+                n_unique     = s.nunique()
+                top_val      = s.value_counts().index[0]
+                top_count    = int(s.value_counts().iloc[0])
+                top_pct      = round(top_count / len(s) * 100, 1)
+                unique_ratio = round(n_unique / len(s) * 100, 1)
+
+                st.markdown("<div class='section-label'>" + col + "</div>",
+                            unsafe_allow_html=True)
+                if unique_ratio > 80:
+                    st.warning("High cardinality (" + str(unique_ratio) +
+                               "% unique) — likely ID or free text. Consider dropping.")
+                elif unique_ratio < 5:
+                    st.success("Low cardinality (" + str(n_unique) +
+                               " unique) — good candidate for encoding.")
+
+                c1,c2,c3,c4,c5 = st.columns(5)
+                c1.metric("Unique",        str(n_unique))
+                c2.metric("Unique %",      str(unique_ratio) + "%")
+                c3.metric("Top Value",     str(top_val)[:20])
+                c4.metric("Top Freq",      str(top_count) + " (" + str(top_pct) + "%)")
+                c5.metric("Missing",       str(null_ct) + " (" + str(null_p) + "%)")
+
+                ch1, ch2 = st.columns(2)
+                with ch1:
+                    top_n    = min(15, n_unique)
+                    top_vals = s.value_counts().head(top_n)
+                    fig, ax  = dark_fig(6, max(3, top_n * 0.35))
+                    ax.barh(top_vals.index[::-1].astype(str),
+                            top_vals.values[::-1], color="#00F5A0", alpha=0.85)
+                    ax.set_title("Top " + str(top_n) + " values",
+                                 color="#F0F0F0", fontsize=10, pad=8)
+                    ax.set_xlabel("Count", color="#AAAAAA", fontsize=8)
+                    ax.spines[["top","right"]].set_visible(False)
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close()
+
+                with ch2:
+                    if null_ct > 0:
+                        fig2, ax2 = dark_fig(5, 3)
+                        ax2.pie([len(s), null_ct],
+                                labels=["Non-null","Null"],
+                                colors=["#00F5A0","#FF416C"],
+                                autopct="%1.1f%%",
+                                textprops={"color":"#F0F0F0","fontsize":9},
+                                wedgeprops={"linewidth":0.5,"edgecolor":"#0D0D0D"})
+                        ax2.set_title("Null vs Non-null",
+                                      color="#F0F0F0", fontsize=10, pad=8)
+                        plt.tight_layout()
+                        st.pyplot(fig2)
+                        plt.close()
+                    else:
+                        st.success("No missing values.")
+                st.divider()
+
+    # ── TAB 3: Correlation ────────────────────────────────────
+    with tab3:
+        if len(numeric_cols) < 2:
+            st.info("Need at least 2 numeric columns.")
+        else:
+            corr = df[numeric_cols].corr()
+            sz   = max(8, len(numeric_cols))
+            fig, ax = plt.subplots(figsize=(sz, sz-1))
+            fig.patch.set_facecolor("#141414")
+            ax.set_facecolor("#141414")
+            sns.heatmap(corr, annot=True, fmt=".2f", ax=ax,
+                        cmap="RdYlGn", center=0,
+                        annot_kws={"size":8,"color":"white"},
+                        linewidths=0.5, linecolor="#2A2A2A")
+            ax.set_title("Correlation Heatmap", color="#F0F0F0", fontsize=12, pad=12)
+            ax.tick_params(colors="#AAAAAA", labelsize=8)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+
+            st.divider()
+            st.markdown("<div class='section-label'>Top 10 Strongest Correlations</div>",
+                        unsafe_allow_html=True)
+            corr_pairs = (corr.where(np.triu(np.ones(corr.shape),k=1).astype(bool))
+                          .stack().reset_index())
+            corr_pairs.columns = ["Column A","Column B","Correlation"]
+            corr_pairs["Abs"]   = corr_pairs["Correlation"].abs()
+            top_corr = (corr_pairs.sort_values("Abs", ascending=False)
+                        .head(10).drop("Abs", axis=1))
+            top_corr["Correlation"] = top_corr["Correlation"].round(3)
+            st.dataframe(top_corr, use_container_width=True, hide_index=True)
+            st.caption("Strong positive (>0.7) or negative (<-0.7) may indicate multicollinearity.")
+
+    # ── TAB 4: Bivariate Analysis ─────────────────────────────
+    with tab4:
+        if target_col is None:
+            st.info("Select a target column from the sidebar to enable bivariate analysis.")
+        else:
+            st.markdown("<div class='section-label'>Target: " + target_col + "</div>",
+                        unsafe_allow_html=True)
+
+            target_series = df[target_col].dropna()
+            n_unique_target = target_series.nunique()
+
+            # Imbalance detection for classification targets
+            if n_unique_target <= 10:
+                st.markdown("<div class='section-label'>Class Distribution</div>",
+                            unsafe_allow_html=True)
+                val_counts = target_series.value_counts()
+                val_pcts   = target_series.value_counts(normalize=True) * 100
+
+                c_cols = st.columns(min(len(val_counts), 5))
+                for i, (val, cnt) in enumerate(val_counts.items()):
+                    if i < len(c_cols):
+                        c_cols[i].metric(str(val), str(cnt) + " (" + str(round(float(val_pcts[val]),1)) + "%)")
+
+                # Imbalance warning
+                max_pct = float(val_pcts.max())
+                min_pct = float(val_pcts.min())
+                if max_pct > 80:
+                    st.error("Severe class imbalance detected — majority class is " +
+                             str(round(max_pct,1)) + "%. Consider SMOTE or class weights.")
+                elif max_pct > 65:
+                    st.warning("Moderate class imbalance — majority class is " +
+                               str(round(max_pct,1)) + "%. Monitor model performance per class.")
+                else:
+                    st.success("Classes are reasonably balanced.")
+
+                # Distribution chart
+                fig, ax = dark_fig(6, 3)
+                ax.bar(val_counts.index.astype(str), val_counts.values,
+                       color=["#00F5A0","#FF416C","#00D9F5","#EF9F27"][:len(val_counts)],
+                       width=0.5)
+                ax.set_title("Target Distribution: " + target_col,
+                             color="#F0F0F0", fontsize=11, pad=8)
+                ax.set_ylabel("Count", color="#AAAAAA", fontsize=9)
+                ax.spines[["top","right"]].set_visible(False)
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close()
+
+                st.divider()
+
+                # Numeric features vs target
+                num_to_plot = [c for c in numeric_cols if c != target_col]
+                if num_to_plot:
+                    st.markdown("<div class='section-label'>Numeric Features vs Target</div>",
+                                unsafe_allow_html=True)
+                    for col in num_to_plot[:8]:
+                        fig, ax = dark_fig(8, 3)
+                        for i, val in enumerate(sorted(target_series.unique())):
+                            subset = df[df[target_col] == val][col].dropna()
+                            if len(subset) >= 3 and subset.std() > 0:
+                                colors_list = ["#00F5A0","#FF416C","#00D9F5","#EF9F27"]
+                                try:
+                                    subset.plot.kde(ax=ax,
+                                                   color=colors_list[i % len(colors_list)],
+                                                   linewidth=2,
+                                                   label=target_col + "=" + str(val))
+                                except Exception:
+                                    pass
+                        ax.set_title(col + " distribution by " + target_col,
+                                     color="#F0F0F0", fontsize=10, pad=8)
+                        ax.set_xlabel(col, color="#AAAAAA", fontsize=8)
+                        ax.legend(facecolor="#141414", edgecolor="#2A2A2A",
+                                  labelcolor="#F0F0F0", fontsize=8)
+                        ax.spines[["top","right"]].set_visible(False)
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close()
+
+                # Categorical features vs target
+                cat_to_plot = [c for c in categorical_cols if c != target_col]
+                if cat_to_plot:
+                    st.markdown("<div class='section-label'>Categorical Features vs Target</div>",
+                                unsafe_allow_html=True)
+                    for col in cat_to_plot[:5]:
+                        top_cats = df[col].value_counts().head(8).index
+                        df_subset = df[df[col].isin(top_cats)].dropna(subset=[target_col])
+                        if len(df_subset) == 0:
+                            continue
+                        ct = pd.crosstab(df_subset[col],
+                                         df_subset[target_col],
+                                         normalize="index") * 100
+                        fig, ax = dark_fig(8, max(3, len(top_cats)*0.4))
+                        ct.plot(kind="barh", ax=ax, stacked=True,
+                                color=["#00F5A0","#FF416C","#00D9F5","#EF9F27"][:ct.shape[1]])
+                        ax.set_title(col + " vs " + target_col + " (%)",
+                                     color="#F0F0F0", fontsize=10, pad=8)
+                        ax.set_xlabel("Percentage", color="#AAAAAA", fontsize=8)
+                        ax.legend(facecolor="#141414", edgecolor="#2A2A2A",
+                                  labelcolor="#F0F0F0", fontsize=8,
+                                  title=target_col,
+                                  title_fontsize=7)
+                        ax.spines[["top","right"]].set_visible(False)
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close()
+
+            else:
+                # Continuous target — scatter plots
+                st.caption("Continuous target detected — showing scatter plots.")
+                num_to_plot = [c for c in numeric_cols if c != target_col]
+                if not num_to_plot:
+                    st.info("No other numeric columns found to plot against this target. "
+                            "Try selecting a different target column.")
+                for col in num_to_plot[:6]:
+                    try:
+                        plot_df = df[[col, target_col]].dropna()
+                        if len(plot_df) == 0:
+                            st.caption(col + ": no valid data after removing nulls, skipping.")
+                            continue
+                        fig, ax = dark_fig(8, 3)
+                        ax.scatter(plot_df[col], plot_df[target_col],
+                                   alpha=0.4, color="#00D9F5", s=15)
+                        ax.set_title(col + " vs " + target_col,
+                                     color="#F0F0F0", fontsize=10, pad=8)
+                        ax.set_xlabel(col, color="#AAAAAA", fontsize=8)
+                        ax.set_ylabel(target_col, color="#AAAAAA", fontsize=8)
+                        ax.spines[["top","right"]].set_visible(False)
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close()
+                    except Exception as e:
+                        st.caption(col + ": chart failed — " + str(e))
+                        continue
+
+    # ── TAB 5: Recommendations ────────────────────────────────
+    with tab5:
+        st.markdown("<div class='section-label'>Feature Recommendations</div>",
+                    unsafe_allow_html=True)
+        st.caption("Automated recommendations based on data quality checks. Review before applying.")
+
+        recs_df = get_feature_recommendations(df, target_col)
+
+        def color_rows(row):
+            if "DROP" in str(row["Recommendation"]):
+                return ["background-color: #3D0000; color: #FF8080"] * len(row)
+            elif any(w in str(row["Recommendation"]).lower() for w in ["impute","transform"]):
+                return ["background-color: #3D2D00; color: #FFD080"] * len(row)
+            elif "encode" in str(row["Recommendation"]).lower():
+                return ["background-color: #003D1A; color: #80FF80"] * len(row)
+            return ["background-color: #1a1a1a; color: #F0F0F0"] * len(row)
+
+        st.dataframe(
+            recs_df.style.apply(color_rows, axis=1),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.divider()
+        st.markdown("<div class='section-label'>Legend</div>", unsafe_allow_html=True)
+        col_l1, col_l2, col_l3 = st.columns(3)
+        col_l1.error("Red — Drop this column")
+        col_l2.warning("Orange — Transform or impute")
+        col_l3.success("Green — Encode for modelling")
+
+    # ── TAB 6: AI Summary ────────────────────────────────────
+    with tab6:
+        st.markdown("<div class='section-label'>AI Dataset Summary</div>",
+                    unsafe_allow_html=True)
+        if st.button("Generate AI Summary", key="btn_ai_summary"):
+            with st.spinner("Analysing your dataset..."):
+                try:
+                    stats_summary = ""
+                    for col in numeric_cols[:5]:
+                        s = df[col].dropna()
+                        if len(s) == 0: continue
+                        n_out, _, _ = detect_outliers(s)
+                        null_p = round(df[col].isnull().sum() / len(df) * 100, 1)
+                        stats_summary += (
+                            col + ": mean=" + str(round(float(s.mean()),2)) +
+                            ", skew=" + str(round(float(s.skew()),2)) +
+                            ", outliers=" + str(n_out) + ". "
+                        )
+
+                    cat_summary = ""
+                    for col in categorical_cols[:3]:
+                        s = df[col].dropna()
+                        if len(s) == 0: continue
+                        null_p = round(df[col].isnull().sum() / len(df) * 100, 1)
+                        cat_summary += (
+                            col + ": " + str(s.nunique()) +
+                            " unique, top=" + str(s.value_counts().index[0]) +
+                            ", null%=" + str(null_p) + ". "
+                        )
+
+                    target_info = ""
+                    if target_col:
+                        t = df[target_col].dropna()
+                        top_vals = t.value_counts().head(5).to_dict()
+                        target_info = (
+                            "Target: " + target_col +
+                            ", unique=" + str(t.nunique()) +
+                            ", top=" + str(top_vals) + ". "
+                        )
+
+                    prompt = (
+                        "Senior data analyst. Dataset: " +
+                        str(df.shape[0]) + "r x " + str(df.shape[1]) + "c. "
+                        "Quality: " + str(quality_score) + "/100. "
+                        "Missing: " + str(missing_pct) + "%. Dups: " + str(duplicates) + ". "
+                        + target_info +
+                        "Numeric: " + stats_summary +
+                        "Categorical: " + cat_summary +
+                        "Write 4 sentences: dataset purpose, key numeric patterns, "
+                        "data quality issues, top 2 predictive columns. Be specific."
+                    )
+
+                    client = Groq(api_key=get_groq_key())
+                    resp   = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[{"role":"user","content":prompt}],
+                        max_tokens=250
+                    )
+                    summary_text = resp.choices[0].message.content
+
+                    st.markdown(
+                        "<div style='background:#141414;border:1px solid #00F5A0;"
+                        "border-radius:10px;padding:16px 20px;color:#F0F0F0;"
+                        "line-height:1.8;font-size:0.95rem;'>"
+                        + summary_text + "</div>",
+                        unsafe_allow_html=True)
+
+                    if "ai_summary" not in st.session_state:
+                        st.session_state["ai_summary"] = ""
+                    st.session_state["ai_summary"] = summary_text
+
+                except Exception as e:
+                    st.warning("AI summary unavailable: " + str(e))
+
+    # ── TAB 7: Download PDF ───────────────────────────────────
+    with tab7:
+        st.markdown("<div class='section-label'>Download Full EDA Report</div>",
+                    unsafe_allow_html=True)
+        st.caption("White background PDF — ready to share with stakeholders.")
+
+        if st.button("Generate PDF Report", key="btn_gen_pdf"):
+            with st.spinner("Building PDF..."):
+                try:
+                    pdf = FPDF()
+                    pdf.set_auto_page_break(auto=True, margin=15)
+                    pdf.add_page()
+
+                    # Title block
+                    pdf.set_fill_color(13,13,13)
+                    pdf.rect(0,0,210,28,"F")
+                    pdf.set_font("Helvetica","B",16)
+                    pdf.set_text_color(0,245,160)
+                    pdf.set_y(6)
+                    pdf.cell(0,8,"DataProfiler - Industry EDA Report",ln=True,align="C")
+                    pdf.set_font("Helvetica","",9)
+                    pdf.set_text_color(150,150,150)
+                    pdf.cell(0,5,"File: " + safe(uploaded.name) +
+                             "   |   Quality Score: " + str(quality_score) + "/100",
+                             ln=True,align="C")
+                    pdf.ln(8)
+
+                    def section(title):
+                        pdf.set_font("Helvetica","B",12)
+                        pdf.set_text_color(0,100,180)
+                        pdf.cell(0,8,title,ln=True)
+                        pdf.set_draw_color(200,200,200)
+                        pdf.line(10,pdf.get_y(),200,pdf.get_y())
+                        pdf.ln(3)
+                        pdf.set_font("Helvetica","",10)
+                        pdf.set_text_color(30,30,30)
+
+                    # Overview
+                    section("1. Dataset Overview")
+                    rows_data = [
+                        ["Rows", str(df.shape[0]), "Columns", str(df.shape[1])],
+                        ["Numeric cols", str(len(numeric_cols)), "Categorical cols", str(len(categorical_cols))],
+                        ["Missing values", str(total_missing)+" ("+str(missing_pct)+"%)", "Duplicates", str(duplicates)],
+                        ["Memory", str(memory_mb)+" MB", "Quality Score", str(quality_score)+"/100"],
+                        ["Rows after dropna", str(len(df_clean)),
+                         "Rows removed", str(len(df)-len(df_clean))+" ("+str(round((len(df)-len(df_clean))/len(df)*100,1))+"%)"],
+                    ]
+                    for row in rows_data:
+                        pdf.set_font("Helvetica","B",9)
+                        pdf.set_text_color(80,80,80)
+                        pdf.cell(50,7,row[0]+":",border=0)
+                        pdf.set_font("Helvetica","",9)
+                        pdf.set_text_color(30,30,30)
+                        pdf.cell(45,7,safe(row[1]),border=0)
+                        pdf.set_font("Helvetica","B",9)
+                        pdf.set_text_color(80,80,80)
+                        pdf.cell(50,7,row[2]+":",border=0)
+                        pdf.set_font("Helvetica","",9)
+                        pdf.set_text_color(30,30,30)
+                        pdf.cell(0,7,safe(row[3]),ln=True)
+                    pdf.ln(4)
+
+                    # Column Summary Table
+                    section("2. Column Summary")
+                    pdf.set_fill_color(230,230,230)
+                    pdf.set_font("Helvetica","B",8)
+                    pdf.set_text_color(30,30,30)
+                    for h,w in [("Column",55),("Type",22),("Non-Null",22),("Null",18),("Null%",18),("Unique",20),("Unique%",20)]:
+                        pdf.cell(w,7,h,border=1,fill=True)
+                    pdf.ln()
+
+                    pdf.set_font("Helvetica","",8)
+                    for i,col in enumerate(df.columns):
+                        fill = i%2==0
+                        pdf.set_fill_color(248,248,248) if fill else pdf.set_fill_color(255,255,255)
+                        null_c = int(df[col].isnull().sum())
+                        null_p_c = str(round(null_c/len(df)*100,1))+"%"
+                        uniq_p = str(round(df[col].nunique()/len(df)*100,1))+"%"
+                        pdf.set_text_color(180,0,0) if null_c>0 else pdf.set_text_color(30,30,30)
+                        pdf.cell(55,6,safe(str(col))[:30],border=1,fill=fill)
+                        pdf.set_text_color(30,30,30)
+                        pdf.cell(22,6,safe(str(df[col].dtype)),border=1,fill=fill)
+                        pdf.cell(22,6,str(df[col].notnull().sum()),border=1,fill=fill)
+                        pdf.cell(18,6,str(null_c),border=1,fill=fill)
+                        pdf.cell(18,6,null_p_c,border=1,fill=fill)
+                        pdf.cell(20,6,str(df[col].nunique()),border=1,fill=fill)
+                        pdf.cell(20,6,uniq_p,border=1,fill=fill)
+                        pdf.ln()
+                    pdf.ln(4)
+
+                    # Numeric Stats
+                    if numeric_cols:
+                        section("3. Numeric Column Statistics")
+                        for col in numeric_cols:
+                            s = df[col].dropna()
+                            if len(s)==0: continue
+                            is_bin = s.nunique() <= 2
+                            n_out,lower,upper = (0,0,0) if is_bin else detect_outliers(s)
+                            null_c = int(df[col].isnull().sum())
+                            pdf.set_font("Helvetica","B",10)
+                            pdf.set_text_color(0,120,60)
+                            pdf.cell(0,7,safe(col),ln=True)
+                            pdf.set_font("Helvetica","",9)
+                            pdf.set_text_color(50,50,50)
+                            for line in [
+                                "  Mean: "+str(round(float(s.mean()),2))+"   Median: "+str(round(float(s.median()),2))+"   Mode: "+str(round(float(s.mode()[0]),2))+"   Std: "+str(round(float(s.std()),2)),
+                                "  Min: "+str(round(float(s.min()),2))+"   Max: "+str(round(float(s.max()),2))+"   Skewness: "+str(round(float(s.skew()),3))+"   Kurtosis: "+str(round(float(s.kurt()),3)),
+                                "  Q1: "+str(round(float(s.quantile(0.25)),2))+"   Q3: "+str(round(float(s.quantile(0.75)),2))+"   IQR: "+str(round(float(s.quantile(0.75)-s.quantile(0.25)),2))+"   P5: "+str(round(float(s.quantile(0.05)),2))+"   P95: "+str(round(float(s.quantile(0.95)),2)),
+                                "  Outliers: "+str(n_out)+" ("+str(round(n_out/len(s)*100,1))+"%)   Bounds: ["+str(lower)+", "+str(upper)+"]   Null: "+str(null_c)+" ("+str(round(null_c/len(df)*100,1))+"%)   "+get_skew_label(float(s.skew())),
+                            ]:
+                                pdf.cell(0,6,safe(line),ln=True)
+                            pdf.ln(2)
+
+                    # Categorical Stats
+                    if categorical_cols:
+                        section("4. Categorical Column Summary")
+                        for col in categorical_cols:
+                            s = df[col].dropna()
+                            if len(s)==0: continue
+                            null_c = int(df[col].isnull().sum())
+                            top3   = s.value_counts().head(3)
+                            pdf.set_font("Helvetica","B",10)
+                            pdf.set_text_color(0,120,60)
+                            pdf.cell(0,7,safe(col),ln=True)
+                            pdf.set_font("Helvetica","",9)
+                            pdf.set_text_color(50,50,50)
+                            pdf.cell(0,6,"  Unique: "+str(s.nunique())+"   Missing: "+str(null_c)+" ("+str(round(null_c/len(df)*100,1))+"%)   Unique%: "+str(round(s.nunique()/len(df)*100,1))+"%",ln=True)
+                            pdf.cell(0,6,"  Top 3: "+safe(", ".join([str(v)+" ("+str(c)+")" for v,c in zip(top3.index,top3.values)])),ln=True)
+                            pdf.ln(2)
+
+                    # Recommendations
+                    section("5. Feature Recommendations")
+                    pdf.set_fill_color(230,230,230)
+                    pdf.set_font("Helvetica","B",8)
+                    pdf.set_text_color(30,30,30)
+                    for h,w in [("Column",45),("Issue",50),("Recommendation",90)]:
+                        pdf.cell(w,7,h,border=1,fill=True)
+                    pdf.ln()
+
+                    recs_df = get_feature_recommendations(df, target_col)
+                    pdf.set_font("Helvetica","",7)
+                    for i,row in recs_df.iterrows():
+                        fill = i%2==0
+                        pdf.set_fill_color(255,240,240) if "DROP" in str(row["Recommendation"]) else (
+                            pdf.set_fill_color(255,250,235) if "impute" in str(row["Recommendation"]).lower() or "transform" in str(row["Recommendation"]).lower()
+                            else pdf.set_fill_color(240,255,245) if "encode" in str(row["Recommendation"]).lower()
+                            else pdf.set_fill_color(248,248,248) if fill else pdf.set_fill_color(255,255,255))
+                        pdf.set_text_color(30,30,30)
+                        pdf.cell(45,6,safe(str(row["Column"]))[:28],border=1,fill=True)
+                        pdf.cell(50,6,safe(str(row["Issue"]))[:32],border=1,fill=True)
+                        pdf.cell(90,6,safe(str(row["Recommendation"]))[:85],border=1,fill=True)
+                        pdf.ln()
+                    pdf.ln(4)
+
+                    # AI Summary
+                    ai_text = st.session_state.get("ai_summary","")
+                    if ai_text:
+                        section("6. AI Analysis Summary")
+                        pdf.set_font("Helvetica","",9)
+                        pdf.set_text_color(30,30,30)
+                        pdf.multi_cell(0,6,safe(ai_text))
+
+                    st.session_state["pdf_bytes"] = bytes(pdf.output())
+                    st.session_state["pdf_filename"] = "eda_report_" + safe(uploaded.name.split(".")[0]) + ".pdf"
+                    st.success("PDF ready — click below to download!")
+
+                except Exception as e:
+                    st.session_state["pdf_bytes"] = None
+                    st.warning("PDF failed: " + str(e))
+
+        if st.session_state.get("pdf_bytes"):
+            st.download_button(
+                "Download Full EDA Report (PDF)",
+                data=st.session_state["pdf_bytes"],
+                file_name=st.session_state["pdf_filename"],
+                mime="application/pdf",
+                use_container_width=True
+            )
